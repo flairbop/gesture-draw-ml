@@ -4,6 +4,7 @@ import csv
 import time
 import os
 import uuid
+import argparse
 import numpy as np
 from src.features import HandFeatureExtractor
 
@@ -16,9 +17,7 @@ CLASSES = {
 }
 
 def get_dummy_features():
-    # Helper to determine feature length dynamically
     ext = HandFeatureExtractor()
-    # Create dummy landmarks
     from collections import namedtuple
     P = namedtuple('P', ['x', 'y'])
     lms = [P(0.5, 0.5)] * 21
@@ -29,6 +28,10 @@ FEATURE_LEN = get_dummy_features()
 HEADER = ["session_id", "timestamp", "label"] + [f"f{i}" for i in range(FEATURE_LEN)]
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--fps', type=int, default=60, help="Target recording FPS (default 60)")
+    args = parser.parse_args()
+
     # Setup MediaPipe
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
@@ -50,26 +53,22 @@ def main():
     is_recording = False
     data_buffer = []
     
-    # Session ID
     session_id = str(uuid.uuid4())[:8]
     
     # Timing
     last_record_time = 0
-    record_interval = 1.0 / 15.0 # 15 FPS
+    record_interval = 1.0 / args.fps 
     
-    # Counts
     session_counts = {k: 0 for k in CLASSES.keys()}
     total_counts = {k: 0 for k in CLASSES.keys()}
     
-    # Load totals if exists
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r') as f:
                 reader = csv.reader(f)
-                next(reader, None) # header
+                next(reader, None)
                 for row in reader:
-                    lbl = row[2] # 3rd col is label name
-                    # Reverse map
+                    lbl = row[2]
                     for k, v in CLASSES.items():
                         if v == lbl:
                             total_counts[k] += 1
@@ -77,9 +76,8 @@ def main():
             pass
 
     print("=== Gesture Data Collector ===")
-    print(f"Session ID: {session_id}")
-    print("Controls: 1=DRAW, 2=HOVER, 3=ERASE")
-    print("SPACE=Toggle Record, N=New Session, Q=Quit")
+    print(f"Session: {session_id} | Target FPS: {args.fps}")
+    print("1=DRAW 2=HOVER 3=ERASE | SPACE=Rec N=New Q=Quit")
 
     while True:
         ret, frame = cap.read()
@@ -95,29 +93,23 @@ def main():
         
         if results.multi_hand_landmarks:
             hand_landmarks = results.multi_hand_landmarks[0]
-            # Check handedness just for feature input (default 1.0/Right if unknown)
-            # multi_handedness is available
             handedness = 1.0
             if results.multi_handedness:
-                # Label is 'Left' or 'Right', score is confidence
-                # We can encode Right=1, Left=0
                 lbl = results.multi_handedness[0].classification[0].label
                 handedness = 1.0 if lbl == 'Right' else 0.0
 
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             
-            # Extract features (stateful)
             feats, extras = extractor.extract(hand_landmarks.landmark, handedness)
             
-            # Draw cursor
-            if 'index_tip' in extras and extras['index_tip']:
+            if 'index_tip' in extras:
                 ix, iy = extras['index_tip']
                 cv2.circle(frame, (int(ix*w), int(iy*h)), 5, (0, 255, 0), -1)
 
-            # Record
+            # Record logic (Time-based high freq)
             if is_recording and feats is not None:
                 curr_time = time.time()
-                if curr_time - last_record_time > record_interval:
+                if curr_time - last_record_time >= record_interval:
                     lbl_name = CLASSES[current_label]
                     row = [session_id, curr_time, lbl_name] + feats.tolist()
                     data_buffer.append(row)
@@ -126,15 +118,11 @@ def main():
                     last_record_time = curr_time
 
         # UI Overlay
-        # Box background for text
         cv2.rectangle(frame, (0,0), (300, 160), (0,0,0), -1)
-        
-        # Status
         mode_txt = "REC" if is_recording else "IDLE"
         mode_col = (0, 0, 255) if is_recording else (100, 100, 100)
         cv2.putText(frame, f"[{mode_txt}] Sess: {session_id}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_col, 2)
-        
-        cv2.putText(frame, f"TARGET: {CLASSES[current_label]}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(frame, f"Target: {CLASSES[current_label]} ({args.fps}hz)", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
         y = 75
         for k, v in CLASSES.items():
@@ -148,6 +136,8 @@ def main():
 
         cv2.imshow('Gesture Data Collector', frame)
         
+        # Don't sleep if we want max throughput, but waitKey is needed for UI
+        # 1ms is standard for real-time loops
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -156,17 +146,14 @@ def main():
         elif key == ord(' '):
             is_recording = not is_recording
         elif key == ord('n'):
-            # New session
             session_id = str(uuid.uuid4())[:8]
             session_counts = {k: 0 for k in CLASSES.keys()}
-            # Also reset extractor history for clean break
             extractor = HandFeatureExtractor(history_len=5)
             print(f"--- New Session: {session_id} ---")
 
     cap.release()
     cv2.destroyAllWindows()
     
-    # Save
     if data_buffer:
         print(f"Saving {len(data_buffer)} samples...")
         file_exists = os.path.exists(DATA_FILE)
