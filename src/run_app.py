@@ -4,183 +4,261 @@ import numpy as np
 import joblib
 import os
 import time
-from src.features import extract_features
-from src.utils import FPS, Smoother
+import json
+import argparse
+from datetime import datetime
+from collections import deque
 
-# Constants
-MODEL_PATH = "models/gesture_model.pkl"
-SCALER_PATH = "models/scaler.pkl"
-CANVAS_COLOR = (255, 255, 255) # White drawing
-THICKNESS = 4
-ERASE_HOLD_TIME = 0.5
+from src.features import HandFeatureExtractor
+from src.utils import FPS, StateMachine, ViterbiDecoder, PointFilter
+
+# Paths
+MODELS_DIR = "models"
+MODEL_PATH = os.path.join(MODELS_DIR, "gesture_model.pkl")
+LABEL_ORDER_PATH = os.path.join(MODELS_DIR, "label_order.json")
+OUTPUT_DIR = "outputs"
+
+CANVAS_COLOR = (255, 255, 255) # White
+BASE_THICKNESS = 4
+
+class StrokeManager:
+    """Manages drawing strokes for undo/redo."""
+    def __init__(self):
+        self.strokes = [] # List of (list of points, thickness)
+        self.current_stroke = []
+        self.current_thicknesses = []
+    
+    def add_point(self, point, thickness):
+        self.current_stroke.append(point)
+        self.current_thicknesses.append(thickness)
+        
+    def end_stroke(self):
+        if self.current_stroke:
+            # Optimize: Simplify stroke or keep raw? keeping raw for now
+            self.strokes.append(list(zip(self.current_stroke, self.current_thicknesses)))
+            self.current_stroke = []
+            self.current_thicknesses = []
+            
+    def undo(self):
+        if self.current_stroke:
+            self.current_stroke = [] # Cancel current
+            self.current_thicknesses = []
+        elif self.strokes:
+            self.strokes.pop()
+
+    def clear(self):
+        self.strokes = []
+        self.current_stroke = []
+        self.current_thicknesses = []
+
+    def draw(self, canvas):
+        canvas[:] = 0 # Clear buffer
+        
+        # Draw saved strokes
+        for stroke_data in self.strokes:
+            if len(stroke_data) < 2: continue
+            pts = np.array([p[0] for p in stroke_data], dtype=np.int32)
+            # Drawing variable width lines is tricky in OpenCV (polylines is constant)
+            # Simplification: Draw segments
+            for i in range(len(stroke_data) - 1):
+                p1 = stroke_data[i][0]
+                p2 = stroke_data[i+1][0]
+                th = int(stroke_data[i][1])
+                cv2.line(canvas, p1, p2, CANVAS_COLOR, th)
+
+        # Draw current stroke
+        if len(self.current_stroke) > 1:
+            for i in range(len(self.current_stroke) - 1):
+                p1 = self.current_stroke[i]
+                p2 = self.current_stroke[i+1]
+                th = int(self.current_thicknesses[i])
+                cv2.line(canvas, p1, p2, CANVAS_COLOR, th)
+
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--camera', type=int, default=0)
+    parser.add_argument('--mirror', type=bool, default=True)
+    parser.add_argument('--window', type=int, default=15, help="Viterbi window size")
+    parser.add_argument('--filter', type=bool, default=True, help="Enable 1Euro filter")
+    args = parser.parse_args()
+
     # Load Model
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(SCALER_PATH):
-        print("Model not found. Please run 'python -m src.collect' then 'python -m src.train'.")
+    if not os.path.exists(MODEL_PATH):
+        print("Model not found. Run training first.")
         return
 
-    clf = joblib.load(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
+    try:
+        pipeline = joblib.load(MODEL_PATH)
+        with open(LABEL_ORDER_PATH, 'r') as f:
+            labels = json.load(f)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
 
-    # Setup MediaPipe
+    # Setup Components
+    extractor = HandFeatureExtractor(history_len=5)
+    viterbi = ViterbiDecoder(labels, window_size=args.window)
+    state_machine = StateMachine()
+    point_filter = PointFilter(min_cutoff=0.1, beta=5.0) if args.filter else None # Tuned for smoothness
+    strokes = StrokeManager()
+    fps_counter = FPS()
+
+    # MediaPipe
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
-    hands = mp_hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5
-    )
+    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.5)
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(args.camera)
     
-    # Canvas
+    # Canvas setup
     ret, frame = cap.read()
     if not ret: return
     h, w, _ = frame.shape
-    canvas = np.zeros((h, w, 3), dtype=np.uint8)
-    
-    # State
-    prev_point = None
-    smoother = Smoother(window_size=8, threshold=0.7)
-    fps_counter = FPS()
-    
-    erase_start_time = None
-    current_state = "HOVER"
+    canvas_mask = np.zeros((h, w, 3), dtype=np.uint8)
+
+    print("=== Gesture Draw ML ===")
+    print("Controls: Q=Quit, Z=Undo, R=Clear, S=Save, F=Toggle Filter")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     while True:
         ret, frame = cap.read()
         if not ret: break
         
-        # Mirror
-        frame = cv2.flip(frame, 1)
-        # Keep canvas same size
-        if frame.shape[:2] != canvas.shape[:2]:
-            canvas = cv2.resize(canvas, (frame.shape[1], frame.shape[0]))
+        if args.mirror:
+            frame = cv2.flip(frame, 1)
             
         h, w, _ = frame.shape
+        if canvas_mask.shape[:2] != (h, w):
+            canvas_mask = cv2.resize(canvas_mask, (w, h))
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
         results = hands.process(rgb)
         
-        predicted_label = "HOVER" # Default safe state
+        # Defaults
+        curr_state = state_machine.state # default to last
         confidence = 0.0
+        cursor_pos = None
+        pinch_dist = 1.0 # default
         
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0] # Max 1 hand
-            
-            # Draw Landmarks (Subtle)
+            hand_landmarks = results.multi_hand_landmarks[0] # Max 1
             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             
-            # Prediction
-            features = extract_features(hand_landmarks.landmark)
-            if features is not None:
-                feat_scaled = scaler.transform([features])
-                probs = clf.predict_proba(feat_scaled)[0]
-                pred_idx = np.argmax(probs)
-                raw_label = clf.classes_[pred_idx]
-                raw_prob = probs[pred_idx]
+            # Predict
+            feats, extras = extractor.extract(hand_landmarks.landmark)
+            if feats is not None:
+                # pipeline handles scaling
+                probs = pipeline.predict_proba([feats])[0]
+                prob_dict = {label: val for label, val in zip(labels, probs)}
                 
-                smoother.update(raw_label, raw_prob)
-                stable_label, stable_prob = smoother.get_stable_prediction()
-                
-                if stable_label:
-                    predicted_label = stable_label
-                    confidence = stable_prob
-            
-            # Cursor Position (Index Tip)
-            idx_tip = hand_landmarks.landmark[8]
-            cx, cy = int(idx_tip.x * w), int(idx_tip.y * h)
-            
-            # State Machine
-            if predicted_label == "DRAW":
-                if prev_point is None:
-                    prev_point = (cx, cy)
-                
-                cv2.line(canvas, prev_point, (cx, cy), CANVAS_COLOR, THICKNESS)
-                prev_point = (cx, cy)
-                erase_start_time = None
-                
-            elif predicted_label == "HOVER":
-                prev_point = (cx, cy)
-                erase_start_time = None
-                # Visual cursor
-                cv2.circle(frame, (cx, cy), 8, (0, 255, 255), 2)
-                
-            elif predicted_label == "ERASE":
-                prev_point = None
-                if erase_start_time is None:
-                    erase_start_time = time.time()
-                elif time.time() - erase_start_time > ERASE_HOLD_TIME:
-                    canvas[:] = 0 # Clear
-                    erase_start_time = None # Reset
-                    
-                # Visual Indicator for erase
-                cv2.circle(frame, (cx, cy), 15, (0, 0, 255), 2)
+                # Update Stabilizers
+                viterbi.update(probs)
+                v_state = viterbi.decode()
+                if v_state:
+                    curr_state = state_machine.update(v_state, prob_dict)
+                    confidence = prob_dict.get(curr_state, 0.0)
 
-            current_state = predicted_label
+                # Cursor Logic
+                if 'index_tip' in extras:
+                    norm_pos = extras['index_tip']
+                    raw_x, raw_y = int(norm_pos[0]*w), int(norm_pos[1]*h)
+                    
+                    if point_filter:
+                        cursor_pos = point_filter.update((raw_x, raw_y))
+                        cursor_pos = (int(cursor_pos[0]), int(cursor_pos[1]))
+                    else:
+                        cursor_pos = (raw_x, raw_y)
+
+                    # Dynamic Width
+                    pd = extras.get('pinch_dist', 0.2)
+                    # Mapping: tight pinch (0.05) -> thin (1), wide (0.15) -> thick (6)? 
+                    # Usually tight pinch = draw efficiently. 
+                    # Let's simple inverse: smaller pinch = slightly thinner?
+                    # Or pressure simulation: smaller pinch = harder press = thicker?
+                    # "Smaller pinch distance => slightly thinner line" per prompt
+                    width_factor = max(1, min(10, int(pd * 20))) 
+                    # Actually if pinch is really small (drawing), we want it stable.
+                    # Let's just fix it to 'pressure' style
+                    brush_width = max(1, 6 - int(pd * 20)) # 0.05 -> 5, 0.2 -> 2
+                    if brush_width < 1: brush_width = 1
 
         else:
             # No hand
-            prev_point = None
-            erase_start_time = None
-            current_state = "NO HAND"
+            pass
 
-        # Blend Canvas
-        # Create mask of canvas to only overlay non-black pixels? 
-        # Or just simple add (lines are white)
-        gray_canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray_canvas, 10, 255, cv2.THRESH_BINARY)
+        # Execution
+        if curr_state == "DRAW" and cursor_pos:
+            strokes.add_point(cursor_pos, brush_width)
+            # Visual feedback
+            cv2.circle(frame, cursor_pos, 3, (0, 0, 255), -1)
+            
+        elif curr_state == "HOVER":
+            strokes.end_stroke()
+            if cursor_pos:
+                cv2.circle(frame, cursor_pos, 5, (0, 255, 255), 2)
+                
+        elif curr_state == "ERASE":
+            strokes.end_stroke()
+            # If held for X time (handled by state machine transition), but visual effect:
+            # State machine only enters ERASE after hold. So if we are HERE, we erase.
+            # But the user spec said "hold... to clear". 
+            # StateMachine enters ERASE after hold. When in ERASE, we clear?
+            # Or does 'ERASE' mean 'Eraser Tool'? The spec said "clear canvas".
+            # So if we are in ERASE state, we clear everything once.
+            if len(strokes.strokes) > 0:
+                strokes.clear()
+            
+            cv2.putText(frame, "ERASED", (w//2 - 50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 3)
+
+        else:
+            strokes.end_stroke()
+
+        # Render Strokes
+        strokes.draw(canvas_mask)
+        
+        # Composite
+        # Black out lines in frame
+        gray = cv2.cvtColor(canvas_mask, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
         inv_mask = cv2.bitwise_not(mask)
         
-        # Black out the lines in the frame
         frame_bg = cv2.bitwise_and(frame, frame, mask=inv_mask)
-        # Take only the lines from canvas
-        canvas_fg = cv2.bitwise_and(canvas, canvas, mask=mask)
-        # Combine
-        final_frame = cv2.add(frame_bg, canvas_fg)
+        final_frame = cv2.add(frame_bg, canvas_mask)
         
-        # Helper: Darken background slightly to pop the drawing? 
-        # Optional: final_frame = cv2.addWeighted(final_frame, 0.8, canvas, 0.2, 0)
-        
-        # UI Overlay
+        # UI
         fps_counter.update()
-        fps_val = fps_counter.get()
+        fps = int(fps_counter.get())
         
-        cv2.putText(final_frame, f"STATE: {current_state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(final_frame, f"CONF: {confidence:.2f}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        cv2.putText(final_frame, f"FPS: {int(fps_val)}", (w - 120, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(final_frame, "Q: Quit | R: Reset", (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
-        
+        cv2.putText(final_frame, f"{curr_state} ({confidence:.2f})", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(final_frame, f"FPS: {fps} | Filt: {'ON' if point_filter else 'OFF'}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(final_frame, "[Z]Undo [S]Save [R]Clear [Q]Quit", (15, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+
         cv2.imshow('Gesture Draw ML', final_frame)
-        
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        elif key == ord('z'):
+            strokes.undo()
         elif key == ord('r'):
-            canvas[:] = 0
+            strokes.clear()
+        elif key == ord('f'):
+            # Toggle filter
+            if point_filter: 
+                point_filter = None
+            else:
+                point_filter = PointFilter(min_cutoff=0.1, beta=5.0)
+        elif key == ord('s'):
+            # Save
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = os.path.join(OUTPUT_DIR, f"drawing_{ts}.png")
+            cv2.imwrite(fname, canvas_mask)
+            print(f"Saved to {fname}")
 
     cap.release()
     cv2.destroyAllWindows()
-
-# Fix typo in utils import if necessary (FPS class)
-class FPS:
-    def __init__(self, avg_len=30):
-        self._prev_time = time.time()
-        self._delays = list()
-        self._avg_len = avg_len
-    
-    def update(self):
-        curr_time = time.time()
-        delay = curr_time - self._prev_time
-        self._prev_time = curr_time
-        self._delays.append(delay)
-        if len(self._delays) > self._avg_len:
-            self._delays.pop(0)
-        
-    def get(self):
-        if not self._delays: return 0.0
-        return 1.0 / (sum(self._delays) / len(self._delays))
 
 if __name__ == "__main__":
     main()

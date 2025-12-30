@@ -1,12 +1,12 @@
 # Gesture Draw ML
 
-A local, webcam-based paint application that uses computer vision and machine learning logic to let you draw on your screen with hand gestures.
+A premium, webcam-based paint application that tracks hand gestures to draw on screen. Powered by MediaPipe and Scikit-Learn with advanced stabilization.
 
 ## Features
-- **Pinch to Draw**: Bring thumb and index finger together to draw.
-- **Open Hand to Hover**: Move the cursor without drawing.
-- **Fist to Erase**: Hold a fist (or just tuck thumb) for >0.5s to clear the canvas.
-- **Customizable**: Train the model on *your* specific hand gestures in under a minute.
+- **Pinch to Draw**: Bring thumb and index finger together. Pressure (pinch tightness) modulates line width.
+- **Smart Smoothing**: Uses Viterbi decoding and 1Euro filters for jitter-free drawing.
+- **Stroke Management**: Undo (`Z`), Clear (`R`), and Save (`S`) functionality.
+- **Robust ML**: Session-aware collection and training with probability calibration.
 
 ## Installation
 
@@ -15,60 +15,57 @@ A local, webcam-based paint application that uses computer vision and machine le
     cd gesture-draw-ml
     ```
 
-2.  **Create a virtual environment** (recommended):
+2.  **Environment**:
     ```bash
     python -m venv .venv
-    source .venv/bin/activate  # Mac/Linux
-    # .venv\Scripts\activate   # Windows
-    ```
-
-3.  **Install dependencies**:
-    ```bash
+    source .venv/bin/activate
     pip install -r requirements.txt
     ```
 
 ## Workflow
 
-### 1. Collect Data
-You need to teach the machine what your gestures look like.
+### 1. Collect Data (`src.collect`)
+Collect data for the 3 classes: DRAW, HOVER, ERASE.
 ```bash
-./scripts/run_collect.sh
-# or python -m src.collect
+python -m src.collect
 ```
 *   **Controls**:
-    *   `1`: Set label to **DRAW** (Make a pinch gesture).
-    *   `2`: Set label to **HOVER** (Relaxed open hand).
-    *   `3`: Set label to **ERASE** (Fist).
+    *   `1`: DRAW (Pinch). Record ~300 frames.
+    *   `2`: HOVER (Open Hand). Record ~300 frames.
+    *   `3`: ERASE (Fist). Record ~300 frames.
     *   `SPACE`: Toggle recording.
-    *   `Q`: Save and Quit.
-*   **Tips**:
-    *   Collect ~500-1000 frames per class.
-    *   Move your hand around the screen, vary rotation slightly, move closer/further.
-    *   Ensure good lighting.
+    *   `N`: Start new session (rotate hand, move specific distance).
+    *   `Q`: Quit.
 
-### 2. Train Model
-Train a Random Forest classifier on your collected data.
+### 2. Train Model (`src.train`)
+Train the classifier (Logistic Regression by default).
 ```bash
-./scripts/run_train.sh
-# or python -m src.train
+python -m src.train --model logreg
 ```
-This should take only a few seconds. It will save the model to `models/gesture_model.pkl`.
+*   Performs session-based validation split.
+*   Calibrates probabilities for better stability.
+*   Saves `models/gesture_model.pkl`.
 
-### 3. Run App
-Start drawing!
+### 3. Run App (`src.run_app`)
+Start drawing.
 ```bash
-./scripts/run_app.sh
-# or python -m src.run_app
+python -m src.run_app --window 15 --filter True
 ```
 *   **Controls**:
+    *   `Pinch`: Draw.
+    *   `Open Hand`: Hover.
+    *   `Fist`: Hold to clear canvas.
+    *   `Z`: Undo last stroke.
+    *   `R`: Clear canvas.
+    *   `S`: Save drawing to `outputs/`.
+    *   `F`: Toggle cursor smoothing.
     *   `Q`: Quit.
-    *   `R`: Clear canvas immediately.
-*   **Behavior**:
-    *   The cursor follows your index finger.
-    *   If you pinch, it draws.
-    *   If you make a fist/erase gesture, a red indicator appears; hold it to wipe the screen.
+
+## Improved Stability
+This project uses two layers of stabilization:
+1.  **Viterbi Decoder**: Smooths the sequence of predicted states (Draw/Hover) to prevent flickering.
+2.  **1Euro Filter**: Smooths the cursor coordinates to remove hand jitter while maintaining responsiveness.
 
 ## Troubleshooting
--   **Webcam not found**: Ensure no other app is using the camera. The app defaults to index `0`.
--   **Jittery drawing**: Collect more data! Ensure "Hover" data looks distinctly different from "Draw" (thumb separated vs touching).
--   **Model accuracy**: Check the output of the training script. If accuracy is low (< 90%), your gestures might be too ambiguous.
+- **Jittery Lines?** Try enabling the filter (Key `F`) or ensure good lighting.
+- **Wrong State?** Collect more data with the `N` key features (new session) to capture different angles.
